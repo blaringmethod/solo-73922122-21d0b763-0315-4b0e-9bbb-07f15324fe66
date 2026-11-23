@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% block title %}双路来水核查 #{{ check.id }} · {{ project.name }}{% endblock %}
+{% block body %}
+<nav class="crumbs">
+  <a href="{{ url_for('view_project', project_id=project.id) }}">← 返回底图 #{{ project.id }}</a>
+</nav>
+
+<section class="card">
+  <h2>双路来水核查 #{{ check.id }}
+    <span class="muted">（底图「{{ project.name }}」，{{ project.rows }}×{{ project.cols }} 格）</span>
+  </h2>
+  <p class="muted">
+    本核查绑定转换成功的快照 <strong>#{{ check.snapshot_id }}</strong>
+    {% if snapshot %}（{{ {'initial':'初次转换','correction':'测绘更正','reconvert':'重新转换'}.get(snapshot.kind, snapshot.kind) }}，
+    {{ snapshot.created_at }} UTC）{% endif %}。
+    快照厘米底图在建立核查时已冻结：之后的测绘更正不会改变这里的结果。
+  </p>
+  <table>
+    <thead><tr><th>位置</th><th>行</th><th>列</th><th>所属测段</th><th>快照厘米值</th></tr></thead>
+    <tbody>
+      {% for label, cell in [('沟口', outlet), ('来水甲', source_a), ('来水乙', source_b)] %}
+      <tr>
+        <td>{{ label }}</td>
+        <td>{{ cell[0] + 1 }}</td>
+        <td>{{ cell[1] + 1 }}</td>
+        <td>{{ segment_of.get(cell, '— 未列入测段，始终用快照值') }}</td>
+        <td>{{ grid_cm[cell[0]][cell[1]] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>测段取值与确认</h2>
+  <p class="muted">
+    每个测段整段二选一：快照厘米值，或备选厘米值。两条路线必须在<strong>同一套</strong>取值下成立。
+    确认后，页面列出的选择与路线只从已确认值出发；撤销确认可让该段重新按建议取值。
+  </p>
+  <table>
+    <thead>
+      <tr><th>测段</th><th>格数</th><th>格子（行,列 = 备选厘米值）</th>
+          <th>本次结果采用</th><th>确认状态</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+    {% for name in segment_names %}
+      {% set use_alt = result.choices[name] if result else false %}
+      {% set confirmed = confirmations.get(name) %}
+      <tr class="{% if confirmed is not none %}confirmed{% endif %}">
+        <td>{{ name }}</td>
+        <td>{{ segments[name]|length }}</td>
+        <td class="cells">
+          {% for (r, c), v in segments[name].items()|sort %}
+            <span class="pair">{{ r + 1 }},{{ c + 1 }} = {{ v }}</span>
+          {% endfor %}
+        </td>
+        <td>
+          {% if result %}
+            {% if use_alt %}<span class="tag alt">备选值</span>{% else %}<span class="tag snap">快照值</span>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if confirmed is none %}<span class="muted">未确认</span>
+          {% elif confirmed %}<span class="tag alt">已确认用备选值</span>
+          {% else %}<span class="tag snap">已确认用快照值</span>{% endif %}
+        </td>
+        <td class="ops">
+          <form action="{{ url_for('confirm_segment', project_id=project.id, check_id=check.id) }}" method="post" class="inline">
+            <input type="hidden" name="segment" value="{{ name }}">
+            <input type="hidden" name="use_alt" value="1">
+            <button class="small" type="submit">确认用备选值</button>
+          </form>
+          <form action="{{ url_for('confirm_segment', project_id=project.id, check_id=check.id) }}" method="post" class="inline">
+            <input type="hidden" name="segment" value="{{ name }}">
+            <input type="hidden" name="use_alt" value="0">
+            <button class="small secondary" type="submit">确认用快照值</button>
+          </form>
+          {% if confirmed is not none %}
+          <form action="{{ url_for('revoke_segment', project_id=project.id, check_id=check.id) }}" method="post" class="inline">
+            <input type="hidden" name="segment" value="{{ name }}">
+            <button class="small danger" type="submit">撤销确认</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>核查结果</h2>
+  {% if result %}
+    <p class="flash ok">
+      找到一套成立的测段选择，两条来水路线只在沟口相交。
+      本结果采用的测段取值（备选值标 <strong>备</strong>，快照值标 <strong>快</strong>）：
+      {% for name in segment_names %}
+        <span class="pill">{{ name }}·{{ '备' if result.choices[name] else '快' }}</span>
+      {% endfor %}
+    </p>
+    {% if problems %}
+    <p class="flash error">自检发现问题：{{ problems|join('；') }}</p>
+    {% endif %}
+    <div class="tables">
+      <div>
+        <h3>来水甲路线（{{ result.path_a|length }} 格）</h3>
+        <ol class="route">
+          {% for cell in result.path_a %}
+          <li>
+            <span class="coord">({{ cell[0] + 1 }},{{ cell[1] + 1 }})</span>
+            {{ result.effective[cell[0]][cell[1]] }} cm
+            {% if cell == outlet %}<span class="tag outlet">沟口</span>
+            {% else %}<span class="muted">{{ segment_of.get(cell, '测段外·快照值') }}</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ol>
+      </div>
+      <div>
+        <h3>来水乙路线（{{ result.path_b|length }} 格）</h3>
+        <ol class="route">
+          {% for cell in result.path_b %}
+          <li>
+            <span class="coord">({{ cell[0] + 1 }},{{ cell[1] + 1 }})</span>
+            {{ result.effective[cell[0]][cell[1]] }} cm
+            {% if cell == outlet %}<span class="tag outlet">沟口</span>
+            {% else %}<span class="muted">{{ segment_of.get(cell, '测段外·快照值') }}</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ol>
+      </div>
+    </div>
+  {% else %}
+    <p class="flash error">
+      {% if any_feasible %}
+        在当前已确认的测段取值下找不到双路。请撤销或调整各测段的确认，页面会按已算流向重新选择。
+      {% else %}
+        找不到双路：没有任何一套测段取值能让两条来水各走一条支路在沟口相交。
+      {% endif %}
+    </p>
+  {% endif %}
+</section>
+
+{% if result %}
+<section class="card">
+  <h2>核查格网（采用本次结果的测段取值）</h2>
+  <p class="muted">
+    每格上行为采用后的厘米高程、下行为该取值下的流向（↑↓←→，· 无下坡，多箭头为并列）。
+    <span class="mark-a">A</span> 来水甲、<span class="mark-b">B</span> 来水乙、
+    <span class="mark-o">O</span> 沟口；深色底为本次列出的两条路线。
+  </p>
+  <table class="grid checkgrid">
+    {% for r in range(project.rows) %}
+    <tr>
+      {% for c in range(project.cols) %}
+      {% set cell = (r, c) %}
+      {% set on_a = cell in result.cell_index_a %}
+      {% set on_b = cell in result.cell_index_b %}
+      <td class="{% if cell == outlet %}outlet{% elif on_a %}path-a{% elif on_b %}path-b{% endif %}">
+        <span class="elev">{{ result.effective[r][c] }}</span>
+        <span class="flow">{{ flow_effective[r][c] }}</span>
+        {% if cell in segment_of %}<span class="cellseg" title="测段 {{ segment_of[cell] }}">{{ segment_of[cell] }}</span>{% endif %}
+        {% if cell == source_a %}<span class="mark mark-a">A</span>{% endif %}
+        {% if cell == source_b %}<span class="mark mark-b">B</span>{% endif %}
+        {% if cell == outlet %}<span class="mark mark-o">O</span>{% endif %}
+      </td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>备选高程测段（{{ segment_names|length }} / {{ max_segments }} 段）</h2>
+  <p class="muted">未列入任何测段的格子始终使用快照厘米值。</p>
+  <table>
+    <thead><tr><th>测段</th><th>格子</th></tr></thead>
+    <tbody>
+    {% for name in segment_names %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>
+          {% for (r, c), v in segments[name].items()|sort %}
+            {{ r + 1 }},{{ c + 1 }} → {{ v }}{% if not loop.last %}；{% endif %}
+          {% endfor %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

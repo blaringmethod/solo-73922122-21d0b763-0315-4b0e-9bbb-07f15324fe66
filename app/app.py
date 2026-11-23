@@ -6,11 +6,13 @@
 * ``snapshots``    每次成功/失败的转换记录；最新一条 status='ok' 的快照
                    即“上一份可下载的底图”，失败时不会被覆盖
 * ``locks``        分米锁定值（沟口等），更正上传时继续沿用
+* ``checks``       双路来水核查：绑定一份成功快照与两个来水格、一个沟口格，
+                   保存备选高程测段，以及建立时一次算好的全部测段取值组合
+* ``check_confirmations`` 核查内每个测段的确认取值（快照值 / 备选值）
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import sqlite3
@@ -27,6 +29,17 @@ from flask import (
     url_for,
 )
 
+from .dual import (
+    MAX_SEGMENTS,
+    decode_flows,
+    effective_grid,
+    mask_choices,
+    parse_alternatives,
+    precompute,
+    select_mask,
+    to_alternative_csv,
+    verify_paths,
+)
 from .solver import (
     MAX_DIM,
     ValidationError,
@@ -96,6 +109,29 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             PRIMARY KEY (project_id, row_idx, col_idx)
         );
+        CREATE TABLE IF NOT EXISTS checks (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+            kind         TEXT NOT NULL DEFAULT 'dual',
+            outlet_row   INTEGER NOT NULL,
+            outlet_col   INTEGER NOT NULL,
+            source_a_row INTEGER NOT NULL,
+            source_a_col INTEGER NOT NULL,
+            source_b_row INTEGER NOT NULL,
+            source_b_col INTEGER NOT NULL,
+            input_cm     TEXT NOT NULL,   -- 建立核查时快照的厘米格网（冻结副本）
+            segments     TEXT NOT NULL,   -- JSON {测段名: {"r,c": 备选厘米}}
+            precomputed  TEXT NOT NULL,   -- JSON 全部测段取值的流向/路线/建议
+            created_at   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS check_confirmations (
+            check_id  INTEGER NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
+            segment   TEXT NOT NULL,
+            use_alt   INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (check_id, segment)
+        );
         """
     )
     conn.commit()
@@ -153,7 +189,10 @@ def _parse_error_limit(raw: str) -> int:
 
 
 def _arrow_table(grid: list[list[int]]) -> list[list[str]]:
-    flows = flow_sets(grid)
+    return _arrow_table_from_flows(flow_sets(grid))
+
+
+def _arrow_table_from_flows(flows: list[list[list[tuple[int, int]]]]) -> list[list[str]]:
     table: list[list[str]] = []
     for r, row in enumerate(flows):
         line = []
@@ -184,6 +223,18 @@ def _dashboard_context(conn: sqlite3.Connection, project: sqlite3.Row) -> dict:
     grid_dm = json.loads(source["grid_dm"]) if source["grid_dm"] else None
     errors = json.loads(source["errors"]) if source["errors"] else None
 
+    ok_snapshots = conn.execute(
+        "SELECT id, kind, source_name, created_at FROM snapshots "
+        "WHERE project_id = ? AND status = 'ok' ORDER BY id DESC",
+        (project["id"],),
+    ).fetchall()
+    check_rows = conn.execute(
+        "SELECT c.*, s.kind AS snapshot_kind, s.created_at AS snapshot_created "
+        "FROM checks c JOIN snapshots s ON s.id = c.snapshot_id "
+        "WHERE c.project_id = ? ORDER BY c.id DESC",
+        (project["id"],),
+    ).fetchall()
+
     return {
         "project": project,
         "snapshots": snaps,
@@ -197,6 +248,152 @@ def _dashboard_context(conn: sqlite3.Connection, project: sqlite3.Row) -> dict:
         "flow_cm": _arrow_table(input_cm),
         "flow_dm": _arrow_table(grid_dm) if grid_dm is not None else None,
         "max_dim": MAX_DIM,
+        "ok_snapshots": ok_snapshots,
+        "checks": check_rows,
+        "max_segments": MAX_SEGMENTS,
+    }
+
+
+def _segments_to_json(segments: dict[str, dict[tuple[int, int], int]]) -> str:
+    return json.dumps(
+        {
+            name: [[r, c, value] for (r, c), value in sorted(cells.items())]
+            for name, cells in segments.items()
+        }
+    )
+
+
+def _segments_from_json(raw: str) -> dict[str, dict[tuple[int, int], int]]:
+    return {
+        name: {(r, c): value for r, c, value in rows}
+        for name, rows in json.loads(raw).items()
+    }
+
+
+def _load_confirmations(conn: sqlite3.Connection, check_id: int) -> dict[str, bool]:
+    rows = conn.execute(
+        "SELECT segment, use_alt FROM check_confirmations WHERE check_id = ?",
+        (check_id,),
+    ).fetchall()
+    return {row["segment"]: bool(row["use_alt"]) for row in rows}
+
+
+def _save_confirmation(
+    conn: sqlite3.Connection, check_id: int, segment: str, use_alt: bool
+) -> None:
+    """写入/覆盖确认（仅在事务内使用，由调用方统一 commit）。"""
+    conn.execute(
+        "INSERT INTO check_confirmations (check_id, segment, use_alt, updated_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(check_id, segment) "
+        "DO UPDATE SET use_alt = excluded.use_alt, updated_at = excluded.updated_at",
+        (check_id, segment, 1 if use_alt else 0, _now()),
+    )
+
+
+def _apply_confirmation(
+    conn: sqlite3.Connection,
+    check: sqlite3.Row,
+    segment: str,
+    use_alt: bool | None,
+) -> int | None:
+    """在同一事务里更新确认，并把页面沿用方案写入已算结果。
+
+    ``use_alt=None`` 表示撤销确认。确认写入与「沿用的方案」一起提交：
+    任何一步失败都会整体回滚，页面仍显示此前的确认与结果。
+    """
+    data = json.loads(check["precomputed"])
+    confirmations = _load_confirmations(conn, check["id"])
+    if use_alt is None:
+        confirmations.pop(segment, None)
+        conn.execute(
+            "DELETE FROM check_confirmations WHERE check_id = ? AND segment = ?",
+            (check["id"], segment),
+        )
+    else:
+        confirmations[segment] = use_alt
+        _save_confirmation(conn, check["id"], segment, use_alt)
+    # 确认时尽量沿用此前列出的方案（未确认测段不无故跳变）；撤销时重新
+    # 选「备选值最少」的可行方案，使该段回到建议取值。
+    prefer = data.get("selected") if use_alt is not None else None
+    mask = select_mask(data, confirmations, prefer=prefer)
+    data["selected"] = mask
+    conn.execute(
+        "UPDATE checks SET precomputed = ? WHERE id = ?",
+        (json.dumps(data), check["id"]),
+    )
+    conn.commit()
+    return mask
+
+
+def _check_context(
+    conn: sqlite3.Connection, project: sqlite3.Row, check: sqlite3.Row
+) -> dict:
+    segments = _segments_from_json(check["segments"])
+    data = json.loads(check["precomputed"])
+    confirmations = _load_confirmations(conn, check["id"])
+    # 本次结果沿用上次列出的方案（data["selected"]），从而「确认后页面给出的
+    # 测段选择和路线」与已确认值一致，且未确认测段不会无故跳变。
+    mask = select_mask(data, confirmations, prefer=data.get("selected"))
+
+    grid_cm = json.loads(check["input_cm"])
+    outlet = (check["outlet_row"], check["outlet_col"])
+    source_a = (check["source_a_row"], check["source_a_col"])
+    source_b = (check["source_b_row"], check["source_b_col"])
+
+    segment_of: dict[tuple[int, int], str] = {}
+    for name, cells in segments.items():
+        for cell in cells:
+            segment_of[cell] = name
+
+    result = None
+    problems: list[str] = []
+    flow_effective = None
+    if mask is not None:
+        entry = data["masks"][str(mask)]
+        path_a = [tuple(cell) for cell in entry["path_a"]]
+        path_b = [tuple(cell) for cell in entry["path_b"]]
+        flows = decode_flows(entry["flows"], data["rows"], data["cols"])
+        problems = verify_paths(
+            entry["flows"], data["rows"], data["cols"],
+            outlet, source_a, source_b, path_a, path_b,
+        )
+        choices = mask_choices(data["segment_names"], mask)
+        effective = effective_grid(
+            grid_cm, data["segment_names"], segments, mask
+        )
+        flow_effective = _arrow_table_from_flows(flows)
+        result = {
+            "mask": mask,
+            "entry": entry,
+            "path_a": path_a,
+            "path_b": path_b,
+            "flows": flows,
+            "choices": choices,
+            "effective": effective,
+            "cell_index_a": {cell: i + 1 for i, cell in enumerate(path_a)},
+            "cell_index_b": {cell: i + 1 for i, cell in enumerate(path_b)},
+        }
+
+    return {
+        "project": project,
+        "check": check,
+        "snapshot_id": check["snapshot_id"],
+        "grid_cm": grid_cm,
+        "outlet": outlet,
+        "source_a": source_a,
+        "source_b": source_b,
+        "segments": segments,
+        "segment_of": segment_of,
+        "segment_names": data["segment_names"],
+        "confirmations": confirmations,
+        "mask": mask,
+        "result": result,
+        "problems": problems,
+        "suggested": data.get("suggested"),
+        "any_feasible": data.get("suggested") is not None,
+        "flow_cm": _arrow_table(grid_cm),
+        "flow_effective": flow_effective,
+        "max_segments": MAX_SEGMENTS,
     }
 
 
@@ -489,6 +686,214 @@ def delete_project(project_id: int):
     conn.commit()
     flash("底图任务已删除", "ok")
     return redirect(url_for("index"))
+
+
+# --------------------------------------------------------------------------- #
+# 双路来水核查
+# --------------------------------------------------------------------------- #
+def _check_or_404(conn: sqlite3.Connection, project_id: int, check_id: int):
+    return conn.execute(
+        "SELECT * FROM checks WHERE id = ? AND project_id = ?",
+        (check_id, project_id),
+    ).fetchone()
+
+
+def _parse_cell(form, prefix: str) -> tuple[int, int]:
+    try:
+        row = int(form.get(f"{prefix}_row", "")) - 1
+        col = int(form.get(f"{prefix}_col", "")) - 1
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("来水格与沟口的行、列都必须是整数") from exc
+    return row, col
+
+
+@app.route("/projects/<int:project_id>/checks", methods=["POST"])
+def create_check(project_id: int):
+    conn = get_db()
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if project is None:
+        flash("底图不存在", "error")
+        return redirect(url_for("index"))
+
+    def fail(message: str):
+        flash(message, "error")
+        return redirect(url_for("view_project", project_id=project_id))
+
+    try:
+        snapshot_id = int(request.form.get("snapshot_id", ""))
+    except ValueError:
+        return fail("请选择一份转换成功的快照")
+    snapshot = conn.execute(
+        "SELECT * FROM snapshots WHERE id = ? AND project_id = ? AND status = 'ok'",
+        (snapshot_id, project_id),
+    ).fetchone()
+    if snapshot is None:
+        return fail("所选快照不存在或不是转换成功的快照，请重新选择")
+
+    try:
+        outlet = _parse_cell(request.form, "outlet")
+        source_a = _parse_cell(request.form, "source_a")
+        source_b = _parse_cell(request.form, "source_b")
+    except ValidationError as exc:
+        return fail(str(exc))
+
+    for label, (r, c) in (("沟口", outlet), ("来水甲", source_a), ("来水乙", source_b)):
+        if not (0 <= r < project["rows"] and 0 <= c < project["cols"]):
+            return fail(
+                f"{label} ({r + 1},{c + 1}) 超出 {project['rows']}×{project['cols']} 格网范围"
+            )
+    if len({outlet, source_a, source_b}) != 3:
+        return fail("来水甲、来水乙与沟口必须是三个不同的格子，位置不能重合")
+
+    try:
+        text = _read_upload(request.files.get("csv_file"))
+        segments = parse_alternatives(text)
+    except ValidationError as exc:
+        return fail(str(exc))
+
+    rows, cols = project["rows"], project["cols"]
+    for name, cells in segments.items():
+        for (r, c) in cells:
+            if not (0 <= r < rows and 0 <= c < cols):
+                return fail(
+                    f"测段「{name}」中的 ({r + 1},{c + 1}) 超出 {rows}×{cols} 格网范围"
+                )
+
+    # 冻结所用快照的厘米底图；后续测绘更正不影响这次核查。
+    # CSV 未列出的格子（含关键格）始终使用快照厘米值，不受测段取值影响。
+    grid_cm = json.loads(snapshot["input_cm"])
+    data = precompute(grid_cm, outlet, source_a, source_b, segments)
+
+    cur = conn.execute(
+        "INSERT INTO checks (project_id, snapshot_id, kind, outlet_row, outlet_col,"
+        " source_a_row, source_a_col, source_b_row, source_b_col, input_cm, segments,"
+        " precomputed, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            project_id, snapshot_id, "dual",
+            outlet[0], outlet[1], source_a[0], source_a[1], source_b[0], source_b[1],
+            json.dumps(grid_cm), _segments_to_json(segments),
+            json.dumps(data), _now(),
+        ),
+    )
+    check_id = cur.lastrowid
+    conn.commit()
+    if data["suggested"] is None:
+        flash(
+            "已建核查，但找不到双路：没有任何一套测段取值能让两条来水各走一条支路"
+            "在沟口相交。",
+            "error",
+        )
+    else:
+        flash(f"核查已建立（#{check_id}），并给出一套成立的测段选择与两条逐格路线。", "ok")
+    return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+
+
+@app.route("/projects/<int:project_id>/checks/<int:check_id>")
+def view_check(project_id: int, check_id: int):
+    conn = get_db()
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if project is None:
+        flash("底图不存在", "error")
+        return redirect(url_for("index"))
+    check = _check_or_404(conn, project_id, check_id)
+    if check is None:
+        flash("核查不存在", "error")
+        return redirect(url_for("view_project", project_id=project_id))
+    snapshot = conn.execute(
+        "SELECT id, kind, source_name, created_at, input_cm FROM snapshots WHERE id = ?",
+        (check["snapshot_id"],),
+    ).fetchone()
+    return render_template(
+        "check.html", snapshot=snapshot, **_check_context(conn, project, check)
+    )
+
+
+@app.route("/projects/<int:project_id>/checks/<int:check_id>/confirm", methods=["POST"])
+def confirm_segment(project_id: int, check_id: int):
+    conn = get_db()
+    check = _check_or_404(conn, project_id, check_id)
+    if check is None:
+        flash("核查不存在", "error")
+        return redirect(url_for("view_project", project_id=project_id))
+    segment = request.form.get("segment", "")
+    use_alt = request.form.get("use_alt") == "1"
+    segments = _segments_from_json(check["segments"])
+    if segment not in segments:
+        flash("该测段不属于此核查", "error")
+        return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+    try:
+        result_mask = _apply_confirmation(conn, check, segment, use_alt)
+    except sqlite3.Error as exc:
+        conn.rollback()
+        # 保存失败：确认与沿用方案都未提交，页面仍是此前的确认与结果。
+        app.logger.exception("保存确认失败: %s", exc)
+        flash("确认保存失败，页面仍显示此前的确认与核查结果。请稍后重试。", "error")
+        return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+    label = "备选值" if use_alt else "快照值"
+    if result_mask is None:
+        flash(
+            f"已确认测段「{segment}」使用{label}；但在这套确认下已找不到双路，"
+            "请撤销或调整其他测段的确认。",
+            "error",
+        )
+        return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+    flash(
+        f"已确认测段「{segment}」使用{label}；结果与路线已按已算流向更新。",
+        "ok",
+    )
+    return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+
+
+@app.route("/projects/<int:project_id>/checks/<int:check_id>/revoke", methods=["POST"])
+def revoke_segment(project_id: int, check_id: int):
+    conn = get_db()
+    check = _check_or_404(conn, project_id, check_id)
+    if check is None:
+        flash("核查不存在", "error")
+        return redirect(url_for("view_project", project_id=project_id))
+    segment = request.form.get("segment", "")
+    segments = _segments_from_json(check["segments"])
+    if segment not in segments:
+        flash("该测段不属于此核查", "error")
+        return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+    try:
+        _apply_confirmation(conn, check, segment, None)
+    except sqlite3.Error as exc:
+        conn.rollback()
+        app.logger.exception("撤销确认失败: %s", exc)
+        flash("撤销确认失败，页面仍显示此前的确认与核查结果。请稍后重试。", "error")
+        return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+    flash(f"已撤销测段「{segment}」的确认，该段重新按建议取值；结果与路线已按已算流向更新。", "ok")
+    return redirect(url_for("view_check", project_id=project_id, check_id=check_id))
+
+
+@app.route("/projects/<int:project_id>/checks/template")
+def check_template(project_id: int):
+    """下载一份可直接改用的备选高程 CSV 模板（按格网尺寸给出三个关键格骨架）。"""
+    conn = get_db()
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if project is None:
+        flash("底图不存在", "error")
+        return redirect(url_for("index"))
+    rows, cols = project["rows"], project["cols"]
+    ok = _latest_ok_snapshot(conn, project_id)
+    grid: list[list[int]] = json.loads(ok["input_cm"]) if ok is not None else []
+    source_a = (0, 0)
+    source_b = (0, cols - 1)
+    outlet = (rows - 1, cols - 1)
+    template: dict[str, dict[tuple[int, int], int]] = {
+        "来水甲测段": {source_a: grid[source_a[0]][source_a[1]] if grid else 0},
+        "来水乙测段": {source_b: grid[source_b[0]][source_b[1]] if grid else 0},
+        "沟口": {outlet: grid[outlet[0]][outlet[1]] if grid else 0},
+    }
+    csv_text = to_alternative_csv(template)
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=check_{project_id}_alternatives_template.csv"
+        },
+    )
 
 
 if __name__ == "__main__":

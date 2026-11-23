@@ -106,6 +106,80 @@
   {% endif %}
 </section>
 
+<section class="card" id="dual-check">
+  <h2>双路来水核查</h2>
+  <p class="muted">
+    指定两个来水格和一个沟口格（三格不能重合），为一份<strong>转换成功</strong>的快照上传备选高程 CSV：
+    每行填 <code>测段,行号,列号,备选厘米值</code>，最多 {{ max_segments }} 段，每格只填一次。
+    同一测段整段统一取快照厘米值或备选值；两条路线须在同一套取值下沿现有四邻流向到达沟口，
+    且只在沟口相交。
+  </p>
+  {% if ok_snapshots %}
+  <form action="{{ url_for('create_check', project_id=project.id) }}"
+        method="post" enctype="multipart/form-data" class="grid-form">
+    <label>转换成功的快照
+      <select name="snapshot_id" required>
+        {% for s in ok_snapshots %}
+        <option value="{{ s.id }}">
+          #{{ s.id }} · {{ {'initial':'初次转换','correction':'测绘更正','reconvert':'重新转换'}.get(s.kind, s.kind) }}
+          · {{ s.created_at }} UTC{% if s.source_name %} · {{ s.source_name }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <div class="inline">
+      <label>来水甲 行（1–{{ project.rows }}）
+        <input type="number" name="source_a_row" min="1" max="{{ project.rows }}" required>
+      </label>
+      <label>来水甲 列（1–{{ project.cols }}）
+        <input type="number" name="source_a_col" min="1" max="{{ project.cols }}" required>
+      </label>
+      <label>来水乙 行
+        <input type="number" name="source_b_row" min="1" max="{{ project.rows }}" required>
+      </label>
+      <label>来水乙 列
+        <input type="number" name="source_b_col" min="1" max="{{ project.cols }}" required>
+      </label>
+      <label>沟口 行
+        <input type="number" name="outlet_row" min="1" max="{{ project.rows }}" required>
+      </label>
+      <label>沟口 列
+        <input type="number" name="outlet_col" min="1" max="{{ project.cols }}" required>
+      </label>
+    </div>
+    <label>备选高程 CSV（测段,行号,列号,备选厘米值；最多 {{ max_segments }} 段）
+      <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    </label>
+    <div class="inline">
+      <button type="submit">建立核查</button>
+      <a class="btn-link" href="{{ url_for('check_template', project_id=project.id) }}">下载备选高程模板</a>
+    </div>
+  </form>
+  {% else %}
+  <p class="muted">尚未有转换成功的快照，无法建立核查。请先在上方完成一次成功转换。</p>
+  {% endif %}
+
+  {% if checks %}
+  <h3>已有核查</h3>
+  <table>
+    <thead><tr><th>核查</th><th>绑定快照</th><th>来水甲</th><th>来水乙</th><th>沟口</th><th>建立时间 (UTC)</th><th></th></tr></thead>
+    <tbody>
+    {% for c in checks %}
+      <tr>
+        <td>#{{ c.id }}</td>
+        <td>#{{ c.snapshot_id }}（{{ {'initial':'初次转换','correction':'测绘更正','reconvert':'重新转换'}.get(c.snapshot_kind, c.snapshot_kind) }}）</td>
+        <td>({{ c.source_a_row + 1 }},{{ c.source_a_col + 1 }})</td>
+        <td>({{ c.source_b_row + 1 }},{{ c.source_b_col + 1 }})</td>
+        <td>({{ c.outlet_row + 1 }},{{ c.outlet_col + 1 }})</td>
+        <td>{{ c.created_at }}</td>
+        <td><a href="{{ url_for('view_check', project_id=project.id, check_id=c.id) }}">查看核查</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+
 <section class="card">
   <h2>上传测绘更正（同尺寸 CSV）</h2>
   <p class="muted">更正上传会自动沿用上面的全部锁定值重新转换；失败时锁定与上一份可下载底图保留不变。</p>
